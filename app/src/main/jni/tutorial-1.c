@@ -2,7 +2,7 @@
 #include <android/log.h>
 
 static jstring native_hello (JNIEnv* env, jobject thiz) {
-    return (*env)->NewStringUTF(env, "Hello from C Code via JNI!");
+    return (*env)->NewStringUTF(env, "Hello from C Code via JNI wleo wleo!");
 }
 
 static JNINativeMethod native_methods[] = {

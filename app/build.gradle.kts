@@ -7,6 +7,7 @@ plugins {
 android {
     namespace = "com.example.gstreamerandroid"
     compileSdk = 36
+    ndkVersion = "25.2.9519653"
 
     defaultConfig {
         applicationId = "com.example.gstreamerandroid"
@@ -14,11 +15,11 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "1.0"
-
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
         externalNativeBuild {
-            cmake {
-                cppFlags += ""
+            ndkBuild {
+                arguments("GSTREAMER_ROOT_ANDROID=C:/gstreamer-1.0-android-universal-1.28.2")
             }
         }
     }

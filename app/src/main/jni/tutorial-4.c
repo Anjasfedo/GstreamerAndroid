@@ -7,6 +7,8 @@
 #include <gst/video/videooverlay.h>
 #include <gst/video/video.h>
 #include <pthread.h>
+#include <gst/video/video-info.h>
+#include <gst/gstpad.h>
 
 GST_DEBUG_CATEGORY_STATIC (debug_category);
 #define GST_CAT_DEFAULT debug_category
@@ -201,19 +203,19 @@ static void check_media_size (CustomData *data) {
     GstElement *video_sink;
     GstPad *video_sink_pad;
     GstCaps *caps;
-    GstVideoFormat fmt;
-    int width;
-    int height;
+    GstVideoInfo vinfo;
+    int width = 0, height = 0;
 
     g_object_get (data->pipeline, "video-sink", &video_sink, NULL);
     video_sink_pad = gst_element_get_static_pad (video_sink, "sink");
-    caps = gst_pad_get_negotiated_caps (video_sink_pad);
+    caps = gst_pad_get_current_caps (video_sink_pad);   // replaces gst_pad_get_negotiated_caps
 
-    if (gst_video_format_parse_caps(caps, &fmt, &width, &height)) {
-        int par_n, par_d;
-        if (gst_video_parse_caps_pixel_aspect_ratio (caps, &par_n, &par_d)) {
-            width = width * par_n / par_d;
-        }
+    if (caps && gst_video_info_from_caps (&vinfo, caps)) {
+        width = GST_VIDEO_INFO_WIDTH (&vinfo);
+        height = GST_VIDEO_INFO_HEIGHT (&vinfo);
+
+        // Apply pixel aspect ratio
+        width = width * vinfo.par_n / vinfo.par_d;
 
         (*env)->CallVoidMethod (env, data->app, on_media_size_changed_method_id, (jint)width, (jint)height);
         if ((*env)->ExceptionCheck (env)) {
@@ -221,9 +223,10 @@ static void check_media_size (CustomData *data) {
         }
     }
 
-    gst_caps_unref(caps);
+    if (caps)
+        gst_caps_unref (caps);
     gst_object_unref (video_sink_pad);
-    gst_object_unref(video_sink);
+    gst_object_unref (video_sink);
 }
 
 static void state_changed_cb (GstBus *bus, GstMessage *msg, CustomData *data) {

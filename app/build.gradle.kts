@@ -19,7 +19,8 @@ android {
 
         externalNativeBuild {
             ndkBuild {
-                arguments("GSTREAMER_ROOT_ANDROID=C:/gstreamer-1.0-android-universal-1.28.2")
+                targets.add("tutorial-4")                     // add to the set
+                arguments("GSTREAMER_ROOT_ANDROID=C:/gst")
             }
         }
     }

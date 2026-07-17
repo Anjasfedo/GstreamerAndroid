@@ -233,8 +233,16 @@ class MainActivity : ComponentActivity() {
         private external fun nativeClassInit(): Boolean
 
         init {
+            // 1. Load the shared C++ runtime
+            System.loadLibrary("c++_shared")
+
+            // 2. Load the GStreamer Android wrapper (fixes the nativeInit crash)
             System.loadLibrary("gstreamer_android")
+
+            // 3. Load your custom JNI code
             System.loadLibrary("tutorial-4")
+
+            // 4. Initialize your custom class mappings
             nativeClassInit()
         }
     }

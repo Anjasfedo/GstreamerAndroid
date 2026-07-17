@@ -7,7 +7,7 @@ plugins {
 android {
     namespace = "com.example.gstreamerandroid"
     compileSdk = 36
-    ndkVersion = "25.2.9519653"
+    ndkVersion = "26.3.11579264"
 
     defaultConfig {
         applicationId = "com.example.gstreamerandroid"
@@ -19,8 +19,11 @@ android {
 
         externalNativeBuild {
             ndkBuild {
-                targets.add("tutorial-4")                     // add to the set
-                arguments("GSTREAMER_ROOT_ANDROID=C:/gst")
+                targets.add("tutorial-4")
+                arguments(
+                    "GSTREAMER_ROOT_ANDROID=C:/gst",
+                    "APP_STL=c++_shared"
+                )
             }
         }
     }

@@ -12,6 +12,8 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.Keep
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -27,6 +29,7 @@ import java.util.*
 
 class MainActivity : ComponentActivity() {
 
+    // -- native methods --
     private external fun nativeInit()
     private external fun nativeFinalize()
     private external fun nativeSetUri(uri: String)
@@ -36,10 +39,12 @@ class MainActivity : ComponentActivity() {
     private external fun nativeSurfaceInit(surface: Any)
     private external fun nativeSurfaceFinalize()
     private external fun nativeGetVersion(): String
+    private external fun nativeStartCameraDiscovery()
 
     @Keep
     private var native_custom_data: Long = 0
 
+    // UI states
     private var uiMessage by mutableStateOf("Initializing...")
     private var uiPosition by mutableIntStateOf(0)
     private var uiDuration by mutableIntStateOf(0)
@@ -49,6 +54,11 @@ class MainActivity : ComponentActivity() {
     private var isPlaying by mutableStateOf(false)
     private var isDraggingSlider by mutableStateOf(false)
     private var currentUri by mutableStateOf<String?>(null)
+
+    // Camera list
+    data class CameraDevice(val name: String, val path: String)
+    private var cameraList by mutableStateOf(listOf<CameraDevice>())
+    private var hasScanned by mutableStateOf(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -87,7 +97,6 @@ class MainActivity : ComponentActivity() {
         runOnUiThread {
             uiMessage = "GStreamer ${nativeGetVersion()} ready"
             isGStreamerInitialized = true
-            // Optionally auto-play if a URI was already set
         }
     }
 
@@ -108,14 +117,16 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /**
-     * Copies a content URI (from file picker) to a local cache file and returns a `file://` URI.
-     * Returns null if the copy fails.
-     */
+    @Keep
+    private fun onCameraDeviceFound(name: String, path: String) {
+        runOnUiThread {
+            cameraList = cameraList + CameraDevice(name, path)
+        }
+    }
+
     private fun copyUriToCache(context: Context, contentUri: Uri): String? {
         return try {
             val inputStream = context.contentResolver.openInputStream(contentUri) ?: return null
-            // Create a temp file in the cache directory
             val cacheFile = File(context.cacheDir, "video_${System.currentTimeMillis()}.mp4")
             FileOutputStream(cacheFile).use { outputStream ->
                 inputStream.copyTo(outputStream)
@@ -131,8 +142,6 @@ class MainActivity : ComponentActivity() {
     private fun playUri(fileUri: String) {
         currentUri = fileUri
         nativeSetUri(fileUri)
-        // The pipeline will be set to PAUSED/PLAYING depending on current state
-        // We'll start playing automatically
         nativePlay()
         isPlaying = true
     }
@@ -145,7 +154,6 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     fun MediaPlayerScreen(modifier: Modifier = Modifier) {
-        // File picker launcher
         val openVideoLauncher = rememberLauncherForActivityResult(
             contract = ActivityResultContracts.OpenDocument()
         ) { uri: Uri? ->
@@ -163,6 +171,7 @@ class MainActivity : ComponentActivity() {
             modifier = modifier.fillMaxSize(),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
+            // Video surface
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -230,6 +239,7 @@ class MainActivity : ComponentActivity() {
                 )
             }
 
+            // Play / Pause / Open File buttons
             Row(
                 horizontalArrangement = Arrangement.Center,
                 modifier = Modifier
@@ -256,7 +266,6 @@ class MainActivity : ComponentActivity() {
 
                 Spacer(modifier = Modifier.width(16.dp))
 
-                // File open button
                 Button(
                     onClick = {
                         openVideoLauncher.launch(arrayOf("video/*"))
@@ -265,6 +274,51 @@ class MainActivity : ComponentActivity() {
                 ) {
                     Text("Open File")
                 }
+            }
+
+            HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+
+            // Camera discovery
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Button(
+                    onClick = {
+                        cameraList = emptyList()
+                        hasScanned = true
+                        nativeStartCameraDiscovery()
+                    },
+                    enabled = isGStreamerInitialized
+                ) {
+                    Text("📷")
+                    Spacer(Modifier.width(8.dp))
+                    Text("Scan Cameras")
+                }
+            }
+
+            if (cameraList.isNotEmpty()) {
+                Text(
+                    "Found cameras:",
+                    style = MaterialTheme.typography.titleSmall,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
+                )
+                LazyColumn(modifier = Modifier.fillMaxWidth().weight(0.5f)) {
+                    items(cameraList) { cam ->
+                        ListItem(
+                            headlineContent = { Text(cam.name) },
+                            supportingContent = { Text(cam.path) }
+                        )
+                    }
+                }
+            } else if (hasScanned) {
+                Text(
+                    "No cameras found",
+                    style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                )
             }
         }
     }

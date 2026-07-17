@@ -9,6 +9,7 @@
 #include <pthread.h>
 #include <gst/video/video-info.h>
 #include <gst/gstpad.h>
+#include <gst/gstdevice.h>
 
 GST_DEBUG_CATEGORY_STATIC (debug_category);
 #define GST_CAT_DEFAULT debug_category
@@ -55,6 +56,7 @@ static jmethodID set_message_method_id;
 static jmethodID set_current_position_method_id;
 static jmethodID on_gstreamer_initialized_method_id;
 static jmethodID on_media_size_changed_method_id;
+static jmethodID on_camera_device_found_method_id;
 
 /* ---------- JNI helpers ---------- */
 static JNIEnv *attach_current_thread (void) {
@@ -193,14 +195,7 @@ static void check_media_size (CustomData *data) {
     if (!data->video_sink) {
         g_object_get (data->pipeline, "video-sink", &data->video_sink, NULL);
         if (data->video_sink) {
-            // Attach the window handle if we have a window and it wasn't attached yet
-            if (data->native_window && !data->initialized) {
-                // already initialized, but window might not have been attached
-                // (initialized flag signals GStreamer ready, but we still need to set window)
-                gst_video_overlay_set_window_handle (GST_VIDEO_OVERLAY (data->video_sink),
-                                                     (guintptr)data->native_window);
-            } else if (data->native_window) {
-                // If we already initialized but window changed, re-attach
+            if (data->native_window) {
                 gst_video_overlay_set_window_handle (GST_VIDEO_OVERLAY (data->video_sink),
                                                      (guintptr)data->native_window);
             }
@@ -221,16 +216,14 @@ static void check_media_size (CustomData *data) {
     gst_object_unref (pad);
 }
 
-/* ---------- Initialization completion (called when surface is ready) ---------- */
+/* ---------- Initialization completion ---------- */
 static void check_initialization_complete (CustomData *data) {
     JNIEnv *env = get_jni_env ();
     if (!data->initialized && data->native_window && data->main_loop) {
-        // Mark as initialized and notify Java
         (*env)->CallVoidMethod (env, data->app, on_gstreamer_initialized_method_id);
         if ((*env)->ExceptionCheck (env)) (*env)->ExceptionClear (env);
         data->initialized = TRUE;
 
-        // Try to set window handle immediately if video sink already exists
         if (!data->video_sink) {
             g_object_get (data->pipeline, "video-sink", &data->video_sink, NULL);
         }
@@ -260,7 +253,6 @@ static void *app_function (void *userdata) {
         return NULL;
     }
 
-    // Disable subtitles
     g_object_get (data->pipeline, "flags", &flags, NULL);
     flags &= ~GST_PLAY_FLAG_TEXT;
     g_object_set (data->pipeline, "flags", flags, NULL);
@@ -281,14 +273,13 @@ static void *app_function (void *userdata) {
     g_signal_connect (bus, "message::clock-lost", (GCallback)clock_lost_cb, data);
     gst_object_unref (bus);
 
-    // Timer for UI position updates + media size check
     GSource *timeout_source = g_timeout_source_new (250);
     g_source_set_callback (timeout_source, (GSourceFunc)refresh_ui, data, NULL);
     g_source_attach (timeout_source, data->context);
     g_source_unref (timeout_source);
 
     data->main_loop = g_main_loop_new (data->context, FALSE);
-    check_initialization_complete (data);   // may fail if surface not ready yet, but will be called again later
+    check_initialization_complete (data);
     g_main_loop_run (data->main_loop);
 
     g_main_loop_unref (data->main_loop);
@@ -319,6 +310,71 @@ static gboolean refresh_ui (CustomData *data) {
         set_current_ui_position (position / GST_MSECOND, data->duration / GST_MSECOND, data);
     }
     return TRUE;
+}
+
+/* ---------- Camera discovery (runs on main GStreamer thread) ---------- */
+typedef struct {
+    jobject thiz;               /* global ref */
+} DiscoveryData;
+
+static gboolean do_camera_discovery(gpointer user_data) {
+    DiscoveryData *ddata = (DiscoveryData *) user_data;
+    JNIEnv *env = get_jni_env();   /* already attached (main GStreamer thread) */
+
+    GstDeviceMonitor *monitor = gst_device_monitor_new();
+    GstCaps *caps = gst_caps_new_empty_simple("Video/Source");
+    gst_device_monitor_add_filter(monitor, "Video/Source", caps);
+    gst_caps_unref(caps);
+
+    GList *devices, *l;
+    if (gst_device_monitor_start(monitor)) {
+        devices = gst_device_monitor_get_devices(monitor);
+        for (l = devices; l != NULL; l = l->next) {
+            GstDevice *device = GST_DEVICE(l->data);
+            gchar *name = gst_device_get_display_name(device);
+            gchar *path = NULL;
+
+            GstStructure *props = gst_device_get_properties(device);
+            if (props) {
+                path = g_strdup(gst_structure_get_string(props, "device.path"));
+                if (!path)
+                    path = g_strdup(gst_structure_get_string(props, "v4l2.device"));
+                gst_structure_free(props);
+            }
+            if (!path) path = g_strdup("unknown");
+
+            jstring jname = (*env)->NewStringUTF(env, name);
+            jstring jpath = (*env)->NewStringUTF(env, path);
+            (*env)->CallVoidMethod(env, ddata->thiz, on_camera_device_found_method_id, jname, jpath);
+            if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+            (*env)->DeleteLocalRef(env, jname);
+            (*env)->DeleteLocalRef(env, jpath);
+
+            g_free(name);
+            g_free(path);
+        }
+        g_list_free_full(devices, gst_object_unref);
+        gst_device_monitor_stop(monitor);
+    }
+    gst_object_unref(monitor);
+
+    (*env)->DeleteGlobalRef(env, ddata->thiz);
+    g_free(ddata);
+    return G_SOURCE_REMOVE;
+}
+
+static void gst_native_start_camera_discovery(JNIEnv* env, jobject thiz) {
+    CustomData *data = GET_CUSTOM_DATA(env, thiz, custom_data_field_id);
+    if (!data) return;
+
+    DiscoveryData *ddata = g_new0(DiscoveryData, 1);
+    ddata->thiz = (*env)->NewGlobalRef(env, thiz);
+
+    /* Schedule on the GStreamer thread's context */
+    GSource *source = g_idle_source_new();
+    g_source_set_callback(source, do_camera_discovery, ddata, NULL);
+    g_source_attach(source, data->context);
+    g_source_unref(source);
 }
 
 /* ---------- JNI exported functions ---------- */
@@ -353,7 +409,6 @@ static void gst_native_set_uri (JNIEnv* env, jobject thiz, jstring uri) {
     data->duration = GST_CLOCK_TIME_NONE;
     data->is_live = (gst_element_set_state (data->pipeline, data->target_state) == GST_STATE_CHANGE_NO_PREROLL);
 
-    // After URI is set, playbin will create the video sink. Attach window if available.
     if (!data->video_sink) {
         g_object_get (data->pipeline, "video-sink", &data->video_sink, NULL);
     }
@@ -402,7 +457,7 @@ static void gst_native_surface_init (JNIEnv *env, jobject thiz, jobject surface)
         }
     }
     data->native_window = new_win;
-    check_initialization_complete (data);   // may now succeed if main loop is running
+    check_initialization_complete (data);
 }
 
 static void gst_native_surface_finalize (JNIEnv *env, jobject thiz) {
@@ -430,9 +485,10 @@ static jboolean gst_native_class_init (JNIEnv* env, jclass klass) {
     set_current_position_method_id = (*env)->GetMethodID (env, klass, "setCurrentPosition", "(II)V");
     on_gstreamer_initialized_method_id = (*env)->GetMethodID (env, klass, "onGStreamerInitialized", "()V");
     on_media_size_changed_method_id = (*env)->GetMethodID (env, klass, "onMediaSizeChanged", "(II)V");
+    on_camera_device_found_method_id = (*env)->GetMethodID (env, klass, "onCameraDeviceFound", "(Ljava/lang/String;Ljava/lang/String;)V");
 
     if (!custom_data_field_id || !set_message_method_id || !on_gstreamer_initialized_method_id ||
-        !on_media_size_changed_method_id || !set_current_position_method_id)
+        !on_media_size_changed_method_id || !set_current_position_method_id || !on_camera_device_found_method_id)
         return JNI_FALSE;
     return JNI_TRUE;
 }
@@ -447,6 +503,7 @@ static JNINativeMethod native_methods[] = {
         { "nativeSurfaceInit", "(Ljava/lang/Object;)V", (void *) gst_native_surface_init},
         { "nativeSurfaceFinalize", "()V", (void *) gst_native_surface_finalize},
         { "nativeGetVersion", "()Ljava/lang/String;", (void *) gst_native_get_version},
+        { "nativeStartCameraDiscovery", "()V", (void *) gst_native_start_camera_discovery},
         { "nativeClassInit", "()Z", (void *) gst_native_class_init}
 };
 

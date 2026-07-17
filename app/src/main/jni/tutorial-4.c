@@ -21,23 +21,38 @@ GST_DEBUG_CATEGORY_STATIC (debug_category);
 # define SET_CUSTOM_DATA(env, thiz, fieldID, data) (*env)->SetLongField (env, thiz, fieldID, (jlong)(jint)data)
 #endif
 
+#define SEEK_MIN_DELAY (500 * GST_MSECOND)
+
 typedef struct _CustomData {
     jobject app;
     GstElement *pipeline;
-    GstElement *video_sink;        // cache the sink element
+    GstElement *video_sink;
     GMainContext *context;
     GMainLoop *main_loop;
     gboolean initialized;
     ANativeWindow *native_window;
     GstState state;
     GstState target_state;
+    gint64 duration;
+    gint64 desired_position;
+    GstClockTime last_seek_time;
+    gboolean is_live;
 } CustomData;
+
+/* Forward declarations */
+static void check_media_size (CustomData *data);
+static gboolean refresh_ui (CustomData *data);
+
+typedef enum {
+    GST_PLAY_FLAG_TEXT = (1 << 2)
+} GstPlayFlags;
 
 static pthread_t gst_app_thread;
 static pthread_key_t current_jni_env;
 static JavaVM *java_vm;
 static jfieldID custom_data_field_id;
 static jmethodID set_message_method_id;
+static jmethodID set_current_position_method_id;
 static jmethodID on_gstreamer_initialized_method_id;
 static jmethodID on_media_size_changed_method_id;
 
@@ -73,6 +88,42 @@ static void set_ui_message (const gchar *message, CustomData *data) {
     (*env)->DeleteLocalRef (env, jmessage);
 }
 
+static void set_current_ui_position (gint position, gint duration, CustomData *data) {
+    JNIEnv *env = get_jni_env ();
+    (*env)->CallVoidMethod (env, data->app, set_current_position_method_id, position, duration);
+    if ((*env)->ExceptionCheck (env)) (*env)->ExceptionClear (env);
+}
+
+/* ---------- Seek logic ---------- */
+static gboolean delayed_seek_cb (CustomData *data);
+
+static void execute_seek (gint64 desired_position, CustomData *data) {
+    gint64 diff;
+    if (desired_position == GST_CLOCK_TIME_NONE)
+        return;
+    diff = gst_util_get_timestamp () - data->last_seek_time;
+    if (GST_CLOCK_TIME_IS_VALID (data->last_seek_time) && diff < SEEK_MIN_DELAY) {
+        GSource *timeout_source;
+        if (data->desired_position == GST_CLOCK_TIME_NONE) {
+            timeout_source = g_timeout_source_new ((SEEK_MIN_DELAY - diff) / GST_MSECOND);
+            g_source_set_callback (timeout_source, (GSourceFunc)delayed_seek_cb, data, NULL);
+            g_source_attach (timeout_source, data->context);
+            g_source_unref (timeout_source);
+        }
+        data->desired_position = desired_position;
+    } else {
+        data->last_seek_time = gst_util_get_timestamp ();
+        gst_element_seek_simple (data->pipeline, GST_FORMAT_TIME,
+                                 GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT, desired_position);
+        data->desired_position = GST_CLOCK_TIME_NONE;
+    }
+}
+
+static gboolean delayed_seek_cb (CustomData *data) {
+    execute_seek (data->desired_position, data);
+    return FALSE;
+}
+
 /* ---------- Bus callbacks ---------- */
 static void error_cb (GstBus *bus, GstMessage *msg, CustomData *data) {
     GError *err;
@@ -87,6 +138,39 @@ static void error_cb (GstBus *bus, GstMessage *msg, CustomData *data) {
     gst_element_set_state (data->pipeline, GST_STATE_NULL);
 }
 
+static void eos_cb (GstBus *bus, GstMessage *msg, CustomData *data) {
+    data->target_state = GST_STATE_PAUSED;
+    data->is_live = (gst_element_set_state (data->pipeline, GST_STATE_PAUSED) == GST_STATE_CHANGE_NO_PREROLL);
+    execute_seek (0, data);
+}
+
+static void duration_cb (GstBus *bus, GstMessage *msg, CustomData *data) {
+    data->duration = GST_CLOCK_TIME_NONE;
+}
+
+static void buffering_cb (GstBus *bus, GstMessage *msg, CustomData *data) {
+    gint percent;
+    if (data->is_live) return;
+    gst_message_parse_buffering (msg, &percent);
+    if (percent < 100 && data->target_state >= GST_STATE_PAUSED) {
+        gchar * message_string = g_strdup_printf ("Buffering %d%%", percent);
+        gst_element_set_state (data->pipeline, GST_STATE_PAUSED);
+        set_ui_message (message_string, data);
+        g_free (message_string);
+    } else if (data->target_state >= GST_STATE_PLAYING) {
+        gst_element_set_state (data->pipeline, GST_STATE_PLAYING);
+    } else if (data->target_state >= GST_STATE_PAUSED) {
+        set_ui_message ("Buffering complete", data);
+    }
+}
+
+static void clock_lost_cb (GstBus *bus, GstMessage *msg, CustomData *data) {
+    if (data->target_state >= GST_STATE_PLAYING) {
+        gst_element_set_state (data->pipeline, GST_STATE_PAUSED);
+        gst_element_set_state (data->pipeline, GST_STATE_PLAYING);
+    }
+}
+
 static void state_changed_cb (GstBus *bus, GstMessage *msg, CustomData *data) {
     GstState old_state, new_state, pending_state;
     gst_message_parse_state_changed (msg, &old_state, &new_state, &pending_state);
@@ -95,17 +179,36 @@ static void state_changed_cb (GstBus *bus, GstMessage *msg, CustomData *data) {
         gchar *message = g_strdup_printf("State changed to %s", gst_element_state_get_name(new_state));
         set_ui_message(message, data);
         g_free (message);
+        if (old_state == GST_STATE_READY && new_state == GST_STATE_PAUSED) {
+            check_media_size (data);
+            if (GST_CLOCK_TIME_IS_VALID (data->desired_position))
+                execute_seek (data->desired_position, data);
+        }
     }
 }
 
-/* ---------- Media size detection (after negotiation) ---------- */
+/* ---------- Media size ---------- */
 static void check_media_size (CustomData *data) {
     JNIEnv *env = get_jni_env ();
+    if (!data->video_sink) {
+        g_object_get (data->pipeline, "video-sink", &data->video_sink, NULL);
+        if (data->video_sink) {
+            // Attach the window handle if we have a window and it wasn't attached yet
+            if (data->native_window && !data->initialized) {
+                // already initialized, but window might not have been attached
+                // (initialized flag signals GStreamer ready, but we still need to set window)
+                gst_video_overlay_set_window_handle (GST_VIDEO_OVERLAY (data->video_sink),
+                                                     (guintptr)data->native_window);
+            } else if (data->native_window) {
+                // If we already initialized but window changed, re-attach
+                gst_video_overlay_set_window_handle (GST_VIDEO_OVERLAY (data->video_sink),
+                                                     (guintptr)data->native_window);
+            }
+        }
+    }
     if (!data->video_sink) return;
-
     GstPad *pad = gst_element_get_static_pad (data->video_sink, "sink");
     if (!pad) return;
-
     GstCaps *caps = gst_pad_get_current_caps (pad);
     GstVideoInfo vinfo;
     if (caps && gst_video_info_from_caps (&vinfo, caps)) {
@@ -118,14 +221,23 @@ static void check_media_size (CustomData *data) {
     gst_object_unref (pad);
 }
 
+/* ---------- Initialization completion (called when surface is ready) ---------- */
 static void check_initialization_complete (CustomData *data) {
     JNIEnv *env = get_jni_env ();
-    if (!data->initialized && data->native_window && data->main_loop && data->video_sink) {
-        // Set window handle on the video sink (glimagesink), which implements GstVideoOverlay
-        gst_video_overlay_set_window_handle (GST_VIDEO_OVERLAY (data->video_sink), (guintptr)data->native_window);
+    if (!data->initialized && data->native_window && data->main_loop) {
+        // Mark as initialized and notify Java
         (*env)->CallVoidMethod (env, data->app, on_gstreamer_initialized_method_id);
         if ((*env)->ExceptionCheck (env)) (*env)->ExceptionClear (env);
         data->initialized = TRUE;
+
+        // Try to set window handle immediately if video sink already exists
+        if (!data->video_sink) {
+            g_object_get (data->pipeline, "video-sink", &data->video_sink, NULL);
+        }
+        if (data->video_sink) {
+            gst_video_overlay_set_window_handle (GST_VIDEO_OVERLAY (data->video_sink),
+                                                 (guintptr)data->native_window);
+        }
     }
 }
 
@@ -134,16 +246,12 @@ static void *app_function (void *userdata) {
     CustomData *data = (CustomData *)userdata;
     GstBus *bus;
     GError *error = NULL;
+    guint flags;
 
     data->context = g_main_context_new ();
     g_main_context_push_thread_default(data->context);
 
-    /* Local test pipeline: videotestsrc ! glimagesink (named "video-sink") */
-    data->pipeline = gst_parse_launch (
-            "videotestsrc ! "
-            "video/x-raw,width=640,height=480,framerate=30/1 ! "
-            "queue ! glimagesink name=video-sink",
-            &error);
+    data->pipeline = gst_parse_launch("playbin", &error);
     if (error) {
         gchar *msg = g_strdup_printf("Pipeline error: %s", error->message);
         g_clear_error (&error);
@@ -152,13 +260,10 @@ static void *app_function (void *userdata) {
         return NULL;
     }
 
-    // Retrieve the video sink element (we'll use it for overlay and size queries)
-    data->video_sink = gst_bin_get_by_name (GST_BIN (data->pipeline), "video-sink");
-    if (!data->video_sink) {
-        set_ui_message("Could not find video-sink element", data);
-        gst_object_unref (data->pipeline);
-        return NULL;
-    }
+    // Disable subtitles
+    g_object_get (data->pipeline, "flags", &flags, NULL);
+    flags &= ~GST_PLAY_FLAG_TEXT;
+    g_object_set (data->pipeline, "flags", flags, NULL);
 
     data->target_state = GST_STATE_READY;
     gst_element_set_state(data->pipeline, GST_STATE_READY);
@@ -169,18 +274,21 @@ static void *app_function (void *userdata) {
     g_source_attach (bus_source, data->context);
     g_source_unref (bus_source);
     g_signal_connect (bus, "message::error", (GCallback)error_cb, data);
-    g_signal_connect (bus, "message::eos", (GCallback)NULL, data);   // unused
+    g_signal_connect (bus, "message::eos", (GCallback)eos_cb, data);
     g_signal_connect (bus, "message::state-changed", (GCallback)state_changed_cb, data);
+    g_signal_connect (bus, "message::duration", (GCallback)duration_cb, data);
+    g_signal_connect (bus, "message::buffering", (GCallback)buffering_cb, data);
+    g_signal_connect (bus, "message::clock-lost", (GCallback)clock_lost_cb, data);
     gst_object_unref (bus);
 
-    // Timer to check media size periodically (will succeed after negotiation)
-    GSource *size_source = g_timeout_source_new (500);
-    g_source_set_callback (size_source, (GSourceFunc)check_media_size, data, NULL);
-    g_source_attach (size_source, data->context);
-    g_source_unref (size_source);
+    // Timer for UI position updates + media size check
+    GSource *timeout_source = g_timeout_source_new (250);
+    g_source_set_callback (timeout_source, (GSourceFunc)refresh_ui, data, NULL);
+    g_source_attach (timeout_source, data->context);
+    g_source_unref (timeout_source);
 
     data->main_loop = g_main_loop_new (data->context, FALSE);
-    check_initialization_complete (data);
+    check_initialization_complete (data);   // may fail if surface not ready yet, but will be called again later
     g_main_loop_run (data->main_loop);
 
     g_main_loop_unref (data->main_loop);
@@ -199,11 +307,27 @@ static void *app_function (void *userdata) {
     return NULL;
 }
 
+/* ---------- UI refresh ---------- */
+static gboolean refresh_ui (CustomData *data) {
+    gint64 position;
+    if (!data || !data->pipeline || data->state < GST_STATE_PAUSED)
+        return TRUE;
+    if (!GST_CLOCK_TIME_IS_VALID (data->duration)) {
+        gst_element_query_duration (data->pipeline, GST_FORMAT_TIME, &data->duration);
+    }
+    if (gst_element_query_position (data->pipeline, GST_FORMAT_TIME, &position)) {
+        set_current_ui_position (position / GST_MSECOND, data->duration / GST_MSECOND, data);
+    }
+    return TRUE;
+}
+
 /* ---------- JNI exported functions ---------- */
 static void gst_native_init (JNIEnv* env, jobject thiz) {
     CustomData *data = g_new0 (CustomData, 1);
+    data->desired_position = GST_CLOCK_TIME_NONE;
+    data->last_seek_time = GST_CLOCK_TIME_NONE;
     SET_CUSTOM_DATA (env, thiz, custom_data_field_id, data);
-    GST_DEBUG_CATEGORY_INIT (debug_category, "tutorial-4", 0, "Android test");
+    GST_DEBUG_CATEGORY_INIT (debug_category, "tutorial-4", 0, "Android tutorial 4");
     data->app = (*env)->NewGlobalRef (env, thiz);
     pthread_create (&gst_app_thread, NULL, &app_function, data);
 }
@@ -218,18 +342,49 @@ static void gst_native_finalize (JNIEnv* env, jobject thiz) {
     SET_CUSTOM_DATA (env, thiz, custom_data_field_id, NULL);
 }
 
+static void gst_native_set_uri (JNIEnv* env, jobject thiz, jstring uri) {
+    CustomData *data = GET_CUSTOM_DATA (env, thiz, custom_data_field_id);
+    if (!data || !data->pipeline) return;
+    const gchar *char_uri = (*env)->GetStringUTFChars (env, uri, NULL);
+    if (data->target_state >= GST_STATE_READY)
+        gst_element_set_state (data->pipeline, GST_STATE_READY);
+    g_object_set(data->pipeline, "uri", char_uri, NULL);
+    (*env)->ReleaseStringUTFChars (env, uri, char_uri);
+    data->duration = GST_CLOCK_TIME_NONE;
+    data->is_live = (gst_element_set_state (data->pipeline, data->target_state) == GST_STATE_CHANGE_NO_PREROLL);
+
+    // After URI is set, playbin will create the video sink. Attach window if available.
+    if (!data->video_sink) {
+        g_object_get (data->pipeline, "video-sink", &data->video_sink, NULL);
+    }
+    if (data->video_sink && data->native_window) {
+        gst_video_overlay_set_window_handle (GST_VIDEO_OVERLAY (data->video_sink),
+                                             (guintptr)data->native_window);
+    }
+}
+
 static void gst_native_play (JNIEnv* env, jobject thiz) {
     CustomData *data = GET_CUSTOM_DATA (env, thiz, custom_data_field_id);
     if (!data) return;
     data->target_state = GST_STATE_PLAYING;
-    gst_element_set_state (data->pipeline, GST_STATE_PLAYING);
+    data->is_live = (gst_element_set_state (data->pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_NO_PREROLL);
 }
 
 static void gst_native_pause (JNIEnv* env, jobject thiz) {
     CustomData *data = GET_CUSTOM_DATA (env, thiz, custom_data_field_id);
     if (!data) return;
     data->target_state = GST_STATE_PAUSED;
-    gst_element_set_state (data->pipeline, GST_STATE_PAUSED);
+    data->is_live = (gst_element_set_state (data->pipeline, GST_STATE_PAUSED) == GST_STATE_CHANGE_NO_PREROLL);
+}
+
+static void gst_native_set_position (JNIEnv* env, jobject thiz, int milliseconds) {
+    CustomData *data = GET_CUSTOM_DATA (env, thiz, custom_data_field_id);
+    if (!data) return;
+    gint64 desired_position = (gint64)(milliseconds * GST_MSECOND);
+    if (data->state >= GST_STATE_PAUSED)
+        execute_seek(desired_position, data);
+    else
+        data->desired_position = desired_position;
 }
 
 static void gst_native_surface_init (JNIEnv *env, jobject thiz, jobject surface) {
@@ -239,16 +394,15 @@ static void gst_native_surface_init (JNIEnv *env, jobject thiz, jobject surface)
     if (data->native_window) {
         ANativeWindow_release (data->native_window);
         if (data->native_window == new_win) {
-            if (data->video_sink) {
+            if (data->video_sink)
                 gst_video_overlay_expose (GST_VIDEO_OVERLAY (data->video_sink));
-            }
             return;
         } else {
             data->initialized = FALSE;
         }
     }
     data->native_window = new_win;
-    check_initialization_complete (data);
+    check_initialization_complete (data);   // may now succeed if main loop is running
 }
 
 static void gst_native_surface_finalize (JNIEnv *env, jobject thiz) {
@@ -273,11 +427,12 @@ static jstring gst_native_get_version (JNIEnv* env, jobject thiz) {
 static jboolean gst_native_class_init (JNIEnv* env, jclass klass) {
     custom_data_field_id = (*env)->GetFieldID (env, klass, "native_custom_data", "J");
     set_message_method_id = (*env)->GetMethodID (env, klass, "setMessage", "(Ljava/lang/String;)V");
+    set_current_position_method_id = (*env)->GetMethodID (env, klass, "setCurrentPosition", "(II)V");
     on_gstreamer_initialized_method_id = (*env)->GetMethodID (env, klass, "onGStreamerInitialized", "()V");
     on_media_size_changed_method_id = (*env)->GetMethodID (env, klass, "onMediaSizeChanged", "(II)V");
 
-    if (!custom_data_field_id || !set_message_method_id ||
-        !on_gstreamer_initialized_method_id || !on_media_size_changed_method_id)
+    if (!custom_data_field_id || !set_message_method_id || !on_gstreamer_initialized_method_id ||
+        !on_media_size_changed_method_id || !set_current_position_method_id)
         return JNI_FALSE;
     return JNI_TRUE;
 }
@@ -285,8 +440,10 @@ static jboolean gst_native_class_init (JNIEnv* env, jclass klass) {
 static JNINativeMethod native_methods[] = {
         { "nativeInit", "()V", (void *) gst_native_init},
         { "nativeFinalize", "()V", (void *) gst_native_finalize},
+        { "nativeSetUri", "(Ljava/lang/String;)V", (void *) gst_native_set_uri},
         { "nativePlay", "()V", (void *) gst_native_play},
         { "nativePause", "()V", (void *) gst_native_pause},
+        { "nativeSetPosition", "(I)V", (void*) gst_native_set_position},
         { "nativeSurfaceInit", "(Ljava/lang/Object;)V", (void *) gst_native_surface_init},
         { "nativeSurfaceFinalize", "()V", (void *) gst_native_surface_finalize},
         { "nativeGetVersion", "()Ljava/lang/String;", (void *) gst_native_get_version},

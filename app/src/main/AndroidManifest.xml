@@ -22,7 +22,13 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.GstreamerAndroid">
 
-        <!-- Activity and other content remain unchanged below -->
+        <!-- This line removes the auto-initializing provider from Sentry -->
+        <provider
+            android:name="io.sentry.android.core.SentryInitProvider"
+            android:authorities="${applicationId}.SentryInitProvider"
+            tools:node="remove" />
+
+        <!-- The rest remains unchanged -->
         <activity
             android:name=".MainActivity"
             android:exported="true"

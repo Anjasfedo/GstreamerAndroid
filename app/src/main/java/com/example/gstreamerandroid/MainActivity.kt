@@ -1,11 +1,11 @@
 package com.example.gstreamerandroid
 
+import android.Manifest
 import android.content.Context
-import android.hardware.camera2.CameraCharacteristics
-import android.hardware.camera2.CameraManager
+import android.content.pm.PackageManager
+import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
 import android.view.SurfaceHolder
 import android.view.SurfaceView
@@ -15,7 +15,6 @@ import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.Keep
-import androidx.annotation.RequiresApi
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -31,11 +30,14 @@ import java.io.File
 import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.*
-import androidx.compose.foundation.clickable
+import io.sentry.Sentry
+import io.sentry.android.core.SentryAndroid
+import android.util.Log
+import org.json.JSONArray
+import org.json.JSONObject
 
 class MainActivity : ComponentActivity() {
 
-    // -- native methods --
     private external fun nativeInit()
     private external fun nativeFinalize()
     private external fun nativeSetUri(uri: String)
@@ -46,13 +48,11 @@ class MainActivity : ComponentActivity() {
     private external fun nativeSurfaceFinalize()
     private external fun nativeGetVersion(): String
     private external fun nativeStartCameraDiscovery()
-
     private external fun nativePlayCamera(cameraIndex: Int)
 
     @Keep
     private var native_custom_data: Long = 0
 
-    // UI states
     private var uiMessage by mutableStateOf("Initializing...")
     private var uiPosition by mutableIntStateOf(0)
     private var uiDuration by mutableIntStateOf(0)
@@ -63,15 +63,39 @@ class MainActivity : ComponentActivity() {
     private var isDraggingSlider by mutableStateOf(false)
     private var currentUri by mutableStateOf<String?>(null)
 
-    // Camera list (will hold both USB and Camera2 entries)
-    data class CameraDevice(val name: String, val path: String)
+    data class CameraDevice(val name: String, val info: String)
     private var cameraList by mutableStateOf(listOf<CameraDevice>())
     private var hasScanned by mutableStateOf(false)
 
     private lateinit var usbManager: UsbManager
 
+    companion object {
+        private const val PERMISSION_REQUEST_CAMERA = 1001
+
+        @JvmStatic private external fun nativeClassInit(): Boolean
+
+        init {
+            System.loadLibrary("c++_shared")
+            System.loadLibrary("gstreamer_android")
+            System.loadLibrary("tutorial-4")
+            nativeClassInit()
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        SentryAndroid.init(this) { options ->
+            options.dsn = "http://7176336d82c242249a607875b922be3d@103.197.190.23:9020/2"
+            options.isDebug = true
+            options.environment = "development"
+        }
+        Sentry.addBreadcrumb("App started with Sentry enabled")
+
+        // Request CAMERA permission if not already granted
+        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.CAMERA), PERMISSION_REQUEST_CAMERA)
+        }
 
         try {
             GStreamer.init(this)
@@ -99,8 +123,27 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
     }
 
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == PERMISSION_REQUEST_CAMERA) {
+            val granted = grantResults.isNotEmpty() &&
+                    grantResults[0] == PackageManager.PERMISSION_GRANTED
+            Sentry.addBreadcrumb("CAMERA permission ${if (granted) "granted" else "denied"}")
+            if (granted) {
+                Toast.makeText(this, "Camera permission granted", Toast.LENGTH_SHORT).show()
+            } else {
+                Toast.makeText(this, "Camera permission denied – cannot use camera", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
     @Keep
     private fun setMessage(message: String) {
+        Sentry.captureMessage("Native: $message")
         runOnUiThread { uiMessage = message }
     }
 
@@ -164,67 +207,59 @@ class MainActivity : ComponentActivity() {
         return df.format(Date(millis.toLong()))
     }
 
-    /**
-     * Lists all USB devices and Camera2 cameras directly in the app.
-     * No USB permission required – just enumerates what the system sees.
-     */
-    @RequiresApi(Build.VERSION_CODES.LOLLIPOP)
-    private fun scanUSBDevicesAndCamera2() {
+    private fun buildUSBDetail(device: UsbDevice): String {
+        val sb = StringBuilder()
+        sb.append("DeviceName: ${device.deviceName}\n")
+        sb.append("VID: ${device.vendorId}, PID: ${device.productId}\n")
+        sb.append("Class: ${device.deviceClass}, Subclass: ${device.deviceSubclass}, Protocol: ${device.deviceProtocol}\n")
+        sb.append("Interfaces:\n")
+        for (i in 0 until device.interfaceCount) {
+            val iface = device.getInterface(i)
+            sb.append("  - id: ${iface.id}, class: ${iface.interfaceClass}, " +
+                    "subclass: ${iface.interfaceSubclass}, protocol: ${iface.interfaceProtocol}\n")
+        }
+        return sb.toString()
+    }
+
+    private fun scanUSBDevices() {
         cameraList = emptyList()
         hasScanned = true
 
-        // 1. Show all USB devices
-        val usbSection = mutableListOf<CameraDevice>()
-        for (device in usbManager.deviceList.values) {
-            val name = device.deviceName ?: "Unknown"
-            val vid = device.vendorId
-            val pid = device.productId
-            val interfaces = buildString {
-                for (i in 0 until device.interfaceCount) {
-                    if (i > 0) append(", ")
-                    append("class=${device.getInterface(i).interfaceClass}")
-                }
+        val devices = usbManager.deviceList.values
+        Log.d("USB_SCAN", "Number of USB devices: ${devices.size}")
+
+        val jsonArray = JSONArray()
+        for (device in devices) {
+            val detail = buildUSBDetail(device)
+            cameraList = cameraList + CameraDevice(device.deviceName ?: "Unknown", detail)
+
+            val jsonDevice = JSONObject().apply {
+                put("name", device.deviceName)
+                put("vid", device.vendorId)
+                put("pid", device.productId)
+                put("class", device.deviceClass)
+                put("subclass", device.deviceSubclass)
+                put("protocol", device.deviceProtocol)
             }
-            val detail = "VID:$vid PID:$pid interfaces: $interfaces"
-            usbSection.add(CameraDevice(name = name, path = detail))
-        }
-
-        if (usbSection.isNotEmpty()) {
-            cameraList = cameraList + CameraDevice(name = "--- USB Devices ---", path = "")
-            cameraList = cameraList + usbSection
-        } else {
-            cameraList = cameraList + CameraDevice(name = "No USB devices found", path = "")
-        }
-
-        // 2. Show Camera2 devices (works for many UVC cameras)
-        try {
-            val cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
-            val cameraIds = cameraManager.cameraIdList
-            if (cameraIds.isNotEmpty()) {
-                cameraList = cameraList + CameraDevice(name = "--- Camera2 Devices ---", path = "")
-                for (id in cameraIds) {
-                    val chars = cameraManager.getCameraCharacteristics(id)
-                    val facing = chars.get(CameraCharacteristics.LENS_FACING)
-                    val isExternal = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                        chars.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL) ==
-                                CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_EXTERNAL
-                    } else false
-                    val desc = when {
-                        isExternal -> "External USB"
-                        facing == CameraCharacteristics.LENS_FACING_FRONT -> "Front"
-                        facing == CameraCharacteristics.LENS_FACING_BACK -> "Back"
-                        else -> "Other"
-                    }
-                    cameraList = cameraList + CameraDevice(name = "$desc camera", path = id)
-                }
-            } else {
-                cameraList = cameraList + CameraDevice(name = "No Camera2 devices", path = "")
+            val ifacesArr = JSONArray()
+            for (i in 0 until device.interfaceCount) {
+                val iface = device.getInterface(i)
+                ifacesArr.put(JSONObject().apply {
+                    put("id", iface.id)
+                    put("class", iface.interfaceClass)
+                    put("subclass", iface.interfaceSubclass)
+                    put("protocol", iface.interfaceProtocol)
+                })
             }
-        } catch (e: Exception) {
-            cameraList = cameraList + CameraDevice(name = "Camera2 error: ${e.message}", path = "")
+            jsonDevice.put("interfaces", ifacesArr)
+            jsonArray.put(jsonDevice)
         }
 
-        // 3. Also call native GStreamer device monitor (likely empty due to SELinux)
+        if (devices.isEmpty()) {
+            cameraList = cameraList + CameraDevice("No USB devices", "")
+        }
+
+        Sentry.captureMessage("USB scan result: ${devices.size} devices, data: $jsonArray")
         nativeStartCameraDiscovery()
     }
 
@@ -308,116 +343,95 @@ class MainActivity : ComponentActivity() {
                         if (isPlaying) nativePlay()
                     },
                     valueRange = 0f..(if (uiDuration > 0) uiDuration.toFloat() else 100f),
-                    modifier = Modifier
-                        .weight(1f)
-                        .padding(start = 16.dp),
+                    modifier = Modifier.weight(1f).padding(start = 16.dp),
                     enabled = isGStreamerInitialized && uiDuration > 0
                 )
             }
 
-            // Play / Pause / Open File buttons
+            // Play / Pause / Open File
             Row(
                 horizontalArrangement = Arrangement.Center,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(16.dp)
+                modifier = Modifier.fillMaxWidth().padding(16.dp)
             ) {
                 Button(
-                    onClick = {
-                        isPlaying = true
-                        nativePlay()
-                    },
+                    onClick = { isPlaying = true; nativePlay() },
                     enabled = isGStreamerInitialized && currentUri != null && !isPlaying
                 ) { Text("Play") }
 
-                Spacer(modifier = Modifier.width(16.dp))
+                Spacer(Modifier.width(16.dp))
 
                 Button(
-                    onClick = {
-                        isPlaying = false
-                        nativePause()
-                    },
+                    onClick = { isPlaying = false; nativePause() },
                     enabled = isGStreamerInitialized && currentUri != null && isPlaying
                 ) { Text("Pause") }
 
-                Spacer(modifier = Modifier.width(16.dp))
+                Spacer(Modifier.width(16.dp))
 
                 Button(
-                    onClick = {
-                        openVideoLauncher.launch(arrayOf("video/*"))
-                    },
+                    onClick = { openVideoLauncher.launch(arrayOf("video/*")) },
                     enabled = isGStreamerInitialized
-                ) {
-                    Text("Open File")
-                }
+                ) { Text("Open File") }
             }
 
             HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
 
-            // Camera discovery button
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp),
-                verticalAlignment = Alignment.CenterVertically
+            // Camera Section
+            Button(
+                onClick = { scanUSBDevices() },
+                enabled = isGStreamerInitialized,
+                modifier = Modifier.padding(horizontal = 16.dp)
             ) {
-                Button(
-                    onClick = {
-                        scanUSBDevicesAndCamera2()
-                    },
-                    enabled = isGStreamerInitialized
-                ) {
-                    Text("📷")
-                    Spacer(Modifier.width(8.dp))
-                    Text("Scan Cameras")
-                }
+                Text("📷 Scan USB Devices")
             }
 
-            // Display results
+            Spacer(Modifier.height(8.dp))
+
+            Button(
+                onClick = {
+                    val camIndex = 1
+                    Sentry.addBreadcrumb("Starting camera with index $camIndex")
+                    Sentry.captureMessage("Camera button pressed, index=$camIndex")
+                    Toast.makeText(this@MainActivity, "Starting camera index $camIndex", Toast.LENGTH_SHORT).show()
+                    nativePlayCamera(camIndex)
+                },
+                enabled = isGStreamerInitialized,
+                modifier = Modifier.padding(horizontal = 16.dp)
+            ) {
+                Text("▶ Start Camera (index 1)")
+            }
+
+            Spacer(Modifier.height(8.dp))
+
             if (cameraList.isNotEmpty()) {
                 LazyColumn(modifier = Modifier.fillMaxWidth().weight(0.5f)) {
                     items(cameraList) { cam ->
-                        if (cam.path.isEmpty()) {
-                            // section header
-                            Text(
-                                text = cam.name,
-                                style = MaterialTheme.typography.titleSmall,
-                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
-                            )
-                        } else {
-                            ListItem(
-                                headlineContent = { Text(cam.name) },
-                                supportingContent = { Text(cam.path) },
-                                modifier = Modifier.clickable {
-                                    // If the camera is an external USB, try to play it via ahcsrc
-                                    if (cam.name.contains("External USB")) {
-                                        // Use camera ID from path (it's the Camera2 ID)
-                                        val id = cam.path.toIntOrNull() ?: 0
-                                        nativePlayCamera(id)
-                                    }
-                                }
-                            )
+                        Card(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 4.dp),
+                            elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+                        ) {
+                            Column(modifier = Modifier.padding(12.dp)) {
+                                Text(
+                                    text = cam.name,
+                                    style = MaterialTheme.typography.titleSmall
+                                )
+                                Text(
+                                    text = cam.info,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    modifier = Modifier.padding(top = 4.dp)
+                                )
+                            }
                         }
                     }
                 }
             } else if (hasScanned) {
                 Text(
-                    "No cameras or USB devices found",
+                    "No USB devices found",
                     style = MaterialTheme.typography.bodyMedium,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
                 )
             }
-        }
-    }
-
-    companion object {
-        @JvmStatic private external fun nativeClassInit(): Boolean
-
-        init {
-            System.loadLibrary("c++_shared")
-            System.loadLibrary("gstreamer_android")
-            System.loadLibrary("tutorial-4")
-            nativeClassInit()
         }
     }
 }

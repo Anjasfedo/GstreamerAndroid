@@ -2,6 +2,11 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
+    <!-- ADD THESE HERE -->
+    <uses-permission android:name="android.permission.USB_HOST" />
+    <uses-feature android:name="android.hardware.usb.host" android:required="true" />
+    <!-- END OF ADDITIONS -->
+
     <uses-permission android:name="android.permission.INTERNET" />
 
     <application
@@ -14,6 +19,8 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.GstreamerAndroid">
+
+        <!-- Activity and other content remain unchanged below -->
         <activity
             android:name=".MainActivity"
             android:exported="true"

@@ -140,9 +140,9 @@ static void *app_function (void *userdata) {
 
     /* Local test pipeline: videotestsrc ! glimagesink (named "video-sink") */
     data->pipeline = gst_parse_launch (
-            "videotestsrc pattern=snow is-live=true ! "
+            "videotestsrc ! "
             "video/x-raw,width=640,height=480,framerate=30/1 ! "
-            "queue ! glimagesink name=video-sink",,
+            "queue ! glimagesink name=video-sink",
             &error);
     if (error) {
         gchar *msg = g_strdup_printf("Pipeline error: %s", error->message);

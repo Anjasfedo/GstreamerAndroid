@@ -5,6 +5,7 @@
     <!-- ADD THESE HERE -->
     <uses-permission android:name="android.permission.USB_HOST" />
     <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.USB_PERMISSION" />
     <uses-feature android:name="android.hardware.usb.host" android:required="true" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <!-- END OF ADDITIONS -->

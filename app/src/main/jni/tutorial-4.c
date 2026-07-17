@@ -10,6 +10,7 @@
 #include <gst/video/video-info.h>
 #include <gst/gstpad.h>
 #include <gst/gstdevice.h>
+#include <unistd.h>          /* for dup, close */
 
 GST_DEBUG_CATEGORY_STATIC (debug_category);
 #define GST_CAT_DEFAULT debug_category
@@ -48,6 +49,8 @@ static void check_initialization_complete (CustomData *data);
 static void cleanup_pipeline (CustomData *data);
 static void start_pipeline_with_uri (CustomData *data, const gchar *uri);
 static void start_pipeline_with_camera (CustomData *data, gint camera_index);
+static void start_pipeline_with_v4l2 (CustomData *data, const gchar *device);
+static void start_pipeline_with_fd (CustomData *data, int usb_fd);
 
 typedef enum {
     GST_PLAY_FLAG_TEXT = (1 << 2)
@@ -255,31 +258,108 @@ static void start_pipeline_with_uri (CustomData *data, const gchar *uri) {
     data->is_live = FALSE;
 }
 
-/* ---------- Camera pipeline ---------- */
+/* ---------- Camera pipeline (ahcsrc by index) ---------- */
 static void start_pipeline_with_camera (CustomData *data, gint camera_index) {
     cleanup_pipeline (data);
-
-    gchar *pipeline_desc = g_strdup_printf (
+    gchar *desc = g_strdup_printf (
             "ahcsrc camera-index=%d ! "
             "video/x-raw,width=640,height=480,framerate=30/1 ! "
             "glimagesink name=video-sink",
             camera_index);
-    data->pipeline = gst_parse_launch (pipeline_desc, NULL);
-    g_free (pipeline_desc);
+    data->pipeline = gst_parse_launch (desc, NULL);
+    g_free (desc);
+    if (!data->pipeline) { set_ui_message ("Failed to create camera pipeline", data); return; }
+    data->video_sink = gst_bin_get_by_name (GST_BIN (data->pipeline), "video-sink");
+    if (data->video_sink && data->native_window)
+        gst_video_overlay_set_window_handle (GST_VIDEO_OVERLAY (data->video_sink), (guintptr)data->native_window);
+    GstBus *bus = gst_element_get_bus (data->pipeline);
+    data->bus_source = gst_bus_create_watch (bus);
+    g_source_set_callback (data->bus_source, (GSourceFunc) gst_bus_async_signal_func, NULL, NULL);
+    g_source_attach (data->bus_source, data->context);
+    g_signal_connect (bus, "message::error", (GCallback)error_cb, data);
+    g_signal_connect (bus, "message::state-changed", (GCallback)state_changed_cb, data);
+    gst_object_unref (bus);
+    data->timeout_source = g_timeout_source_new (250);
+    g_source_set_callback (data->timeout_source, (GSourceFunc)refresh_ui, data, NULL);
+    g_source_attach (data->timeout_source, data->context);
+    data->target_state = GST_STATE_PLAYING;
+    gst_element_set_state (data->pipeline, GST_STATE_PLAYING);
+    data->is_live = TRUE;
+}
 
-    if (!data->pipeline) {
-        set_ui_message ("Failed to create camera pipeline", data);
+/* ---------- V4L2 source pipeline ---------- */
+static void start_pipeline_with_v4l2 (CustomData *data, const gchar *device) {
+    cleanup_pipeline (data);
+    gchar *desc = g_strdup_printf (
+            "v4l2src device=%s ! "
+            "video/x-raw,width=640,height=480,framerate=30/1 ! "
+            "glimagesink name=video-sink",
+            device);
+    data->pipeline = gst_parse_launch (desc, NULL);
+    g_free (desc);
+    if (!data->pipeline) { set_ui_message("Failed to create v4l2 pipeline", data); return; }
+    data->video_sink = gst_bin_get_by_name (GST_BIN (data->pipeline), "video-sink");
+    if (data->video_sink && data->native_window)
+        gst_video_overlay_set_window_handle (GST_VIDEO_OVERLAY (data->video_sink), (guintptr)data->native_window);
+    GstBus *bus = gst_element_get_bus (data->pipeline);
+    data->bus_source = gst_bus_create_watch (bus);
+    g_source_set_callback (data->bus_source, (GSourceFunc) gst_bus_async_signal_func, NULL, NULL);
+    g_source_attach (data->bus_source, data->context);
+    g_signal_connect (bus, "message::error", (GCallback)error_cb, data);
+    g_signal_connect (bus, "message::state-changed", (GCallback)state_changed_cb, data);
+    gst_object_unref (bus);
+    data->timeout_source = g_timeout_source_new (250);
+    g_source_set_callback (data->timeout_source, (GSourceFunc)refresh_ui, data, NULL);
+    g_source_attach (data->timeout_source, data->context);
+    data->target_state = GST_STATE_PLAYING;
+    gst_element_set_state (data->pipeline, GST_STATE_PLAYING);
+    data->is_live = TRUE;
+}
+
+/* ---------- Raw FD pipeline (USB camera via ahcsrc fd property) ---------- */
+static void start_pipeline_with_fd (CustomData *data, int usb_fd) {
+    cleanup_pipeline (data);
+
+    int dup_fd = dup(usb_fd);
+    if (dup_fd < 0) {
+        set_ui_message("Failed to duplicate file descriptor", data);
         return;
     }
 
-    /* Get the video sink and attach window if available */
-    data->video_sink = gst_bin_get_by_name (GST_BIN (data->pipeline), "video-sink");
-    if (data->video_sink && data->native_window) {
-        gst_video_overlay_set_window_handle (GST_VIDEO_OVERLAY (data->video_sink),
-                                             (guintptr)data->native_window);
+    GstElement *ahcsrc = gst_element_factory_make ("ahcsrc", "source");
+    GstElement *capsfilter = gst_element_factory_make ("capsfilter", "filter");
+    GstElement *videosink = gst_element_factory_make ("glimagesink", "video-sink");
+
+    if (!ahcsrc || !capsfilter || !videosink) {
+        set_ui_message("Failed to create FD pipeline elements (ahcsrc)", data);
+        if (ahcsrc) gst_object_unref (ahcsrc);
+        if (capsfilter) gst_object_unref (capsfilter);
+        if (videosink) gst_object_unref (videosink);
+        close(dup_fd);
+        return;
     }
 
-    /* Set up bus and timeout (camera is live, no duration) */
+    GstCaps *caps = gst_caps_from_string ("video/x-raw,width=640,height=480,framerate=30/1");
+    g_object_set (G_OBJECT (capsfilter), "caps", caps, NULL);
+    gst_caps_unref (caps);
+
+    /* Force ahcsrc to use the provided fd, not any built‑in camera */
+    g_object_set (G_OBJECT (ahcsrc), "fd", dup_fd, NULL);
+    g_object_set (G_OBJECT (ahcsrc), "camera-index", -1, NULL);
+
+    data->pipeline = gst_pipeline_new ("usb-pipeline");
+    gst_bin_add_many (GST_BIN (data->pipeline), ahcsrc, capsfilter, videosink, NULL);
+    if (!gst_element_link_many (ahcsrc, capsfilter, videosink, NULL)) {
+        set_ui_message ("Failed to link FD pipeline (ahcsrc)", data);
+        cleanup_pipeline (data);
+        close(dup_fd);
+        return;
+    }
+
+    data->video_sink = videosink;
+    if (data->video_sink && data->native_window)
+        gst_video_overlay_set_window_handle (GST_VIDEO_OVERLAY (data->video_sink), (guintptr)data->native_window);
+
     GstBus *bus = gst_element_get_bus (data->pipeline);
     data->bus_source = gst_bus_create_watch (bus);
     g_source_set_callback (data->bus_source, (GSourceFunc) gst_bus_async_signal_func, NULL, NULL);
@@ -311,6 +391,24 @@ static gboolean switch_to_camera_cb (gpointer user_data) {
     CameraSwitchData *cs = (CameraSwitchData *) user_data;
     start_pipeline_with_camera (cs->data, cs->camera_index);
     g_free (cs);
+    return G_SOURCE_REMOVE;
+}
+
+typedef struct { CustomData *data; gchar *device; } V4L2SwitchData;
+static gboolean switch_to_v4l2_cb (gpointer user_data) {
+    V4L2SwitchData *vs = (V4L2SwitchData *) user_data;
+    start_pipeline_with_v4l2 (vs->data, vs->device);
+    g_free (vs->device);
+    g_free (vs);
+    return G_SOURCE_REMOVE;
+}
+
+typedef struct { CustomData *data; int fd; } FDSwitchData;
+static gboolean switch_to_fd_cb (gpointer user_data) {
+    FDSwitchData *fs = (FDSwitchData *) user_data;
+    start_pipeline_with_fd (fs->data, fs->fd);
+    close(fs->fd);
+    g_free (fs);
     return G_SOURCE_REMOVE;
 }
 
@@ -354,7 +452,7 @@ static gboolean refresh_ui (CustomData *data) {
     return TRUE;
 }
 
-/* ---------- Camera discovery (unchanged) ---------- */
+/* ---------- Camera discovery ---------- */
 typedef struct { jobject thiz; } DiscoveryData;
 static gboolean do_camera_discovery (gpointer user_data) {
     DiscoveryData *ddata = (DiscoveryData *) user_data;
@@ -432,7 +530,6 @@ static void gst_native_set_uri (JNIEnv* env, jobject thiz, jstring uri) {
     g_source_attach (source, data->context); g_source_unref (source);
 }
 
-/* Real camera playback */
 static void gst_native_play_camera (JNIEnv* env, jobject thiz, jint cameraIndex) {
     CustomData *data = GET_CUSTOM_DATA (env, thiz, custom_data_field_id);
     if (!data) return;
@@ -441,6 +538,32 @@ static void gst_native_play_camera (JNIEnv* env, jobject thiz, jint cameraIndex)
     cs->camera_index = cameraIndex;
     GSource *source = g_idle_source_new ();
     g_source_set_callback (source, switch_to_camera_cb, cs, NULL);
+    g_source_attach (source, data->context);
+    g_source_unref (source);
+}
+
+static void gst_native_play_camera_v4l2 (JNIEnv* env, jobject thiz, jstring device) {
+    CustomData *data = GET_CUSTOM_DATA (env, thiz, custom_data_field_id);
+    if (!data) return;
+    const gchar *char_device = (*env)->GetStringUTFChars (env, device, NULL);
+    V4L2SwitchData *vs = g_new (V4L2SwitchData, 1);
+    vs->data = data;
+    vs->device = g_strdup (char_device);
+    (*env)->ReleaseStringUTFChars (env, device, char_device);
+    GSource *source = g_idle_source_new ();
+    g_source_set_callback (source, switch_to_v4l2_cb, vs, NULL);
+    g_source_attach (source, data->context);
+    g_source_unref (source);
+}
+
+static void gst_native_play_camera_fd (JNIEnv* env, jobject thiz, jint fd) {
+    CustomData *data = GET_CUSTOM_DATA (env, thiz, custom_data_field_id);
+    if (!data) return;
+    FDSwitchData *fs = g_new (FDSwitchData, 1);
+    fs->data = data;
+    fs->fd = fd;
+    GSource *source = g_idle_source_new ();
+    g_source_set_callback (source, switch_to_fd_cb, fs, NULL);
     g_source_attach (source, data->context);
     g_source_unref (source);
 }
@@ -495,6 +618,19 @@ static void gst_native_surface_finalize (JNIEnv *env, jobject thiz) {
     data->native_window = NULL; data->initialized = FALSE;
 }
 
+/* ---------- v4l2src availability check (returns string) ---------- */
+static jstring gst_native_check_v4l2 (JNIEnv* env, jobject thiz) {
+    GstElement *v4l2src = gst_element_factory_make ("v4l2src", NULL);
+    const gchar *result;
+    if (v4l2src) {
+        result = "v4l2src available";
+        gst_object_unref(v4l2src);
+    } else {
+        result = "v4l2src NOT available";
+    }
+    return (*env)->NewStringUTF(env, result);
+}
+
 static jstring gst_native_get_version (JNIEnv* env, jobject thiz) {
     char *ver = gst_version_string ();
     jstring jver = (*env)->NewStringUTF (env, ver);
@@ -525,8 +661,11 @@ static JNINativeMethod native_methods[] = {
         { "nativeSurfaceInit", "(Ljava/lang/Object;)V", (void *) gst_native_surface_init},
         { "nativeSurfaceFinalize", "()V", (void *) gst_native_surface_finalize},
         { "nativeGetVersion", "()Ljava/lang/String;", (void *) gst_native_get_version},
+        { "nativeCheckV4L2", "()Ljava/lang/String;", (void *) gst_native_check_v4l2},
         { "nativeStartCameraDiscovery", "()V", (void *) gst_native_start_camera_discovery},
         { "nativePlayCamera", "(I)V", (void *) gst_native_play_camera},
+        { "nativePlayCameraV4L2", "(Ljava/lang/String;)V", (void *) gst_native_play_camera_v4l2},
+        { "nativePlayCameraFD", "(I)V", (void *) gst_native_play_camera_fd},
         { "nativeClassInit", "()Z", (void *) gst_native_class_init}
 };
 

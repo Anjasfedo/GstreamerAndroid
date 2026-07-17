@@ -1,11 +1,18 @@
 package com.example.gstreamerandroid
 
 import android.Manifest
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.view.SurfaceHolder
 import android.view.SurfaceView
@@ -47,8 +54,11 @@ class MainActivity : ComponentActivity() {
     private external fun nativeSurfaceInit(surface: Any)
     private external fun nativeSurfaceFinalize()
     private external fun nativeGetVersion(): String
+    private external fun nativeCheckV4L2(): String
     private external fun nativeStartCameraDiscovery()
     private external fun nativePlayCamera(cameraIndex: Int)
+    private external fun nativePlayCameraV4L2(device: String)
+    private external fun nativePlayCameraFD(fd: Int)
 
     @Keep
     private var native_custom_data: Long = 0
@@ -67,10 +77,13 @@ class MainActivity : ComponentActivity() {
     private var cameraList by mutableStateOf(listOf<CameraDevice>())
     private var hasScanned by mutableStateOf(false)
 
+    private var externalCameraIds by mutableStateOf(listOf<String>())
+
     private lateinit var usbManager: UsbManager
 
     companion object {
         private const val PERMISSION_REQUEST_CAMERA = 1001
+        const val ACTION_USB_PERMISSION = "com.example.gstreamerandroid.USB_PERMISSION"
 
         @JvmStatic private external fun nativeClassInit(): Boolean
 
@@ -79,6 +92,19 @@ class MainActivity : ComponentActivity() {
             System.loadLibrary("gstreamer_android")
             System.loadLibrary("tutorial-4")
             nativeClassInit()
+        }
+    }
+
+    private val usbPermissionReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (ACTION_USB_PERMISSION == intent.action) {
+                val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
+                if (granted) {
+                    findAndStartRawUSBCamera()
+                } else {
+                    Toast.makeText(this@MainActivity, "USB permission denied", Toast.LENGTH_LONG).show()
+                }
+            }
         }
     }
 
@@ -92,7 +118,6 @@ class MainActivity : ComponentActivity() {
         }
         Sentry.addBreadcrumb("App started with Sentry enabled")
 
-        // Request CAMERA permission if not already granted
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.CAMERA), PERMISSION_REQUEST_CAMERA)
         }
@@ -123,6 +148,16 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
     }
 
+    override fun onResume() {
+        super.onResume()
+        registerReceiver(usbPermissionReceiver, IntentFilter(ACTION_USB_PERMISSION), RECEIVER_EXPORTED)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        unregisterReceiver(usbPermissionReceiver)
+    }
+
     override fun onRequestPermissionsResult(
         requestCode: Int,
         permissions: Array<String>,
@@ -130,8 +165,7 @@ class MainActivity : ComponentActivity() {
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == PERMISSION_REQUEST_CAMERA) {
-            val granted = grantResults.isNotEmpty() &&
-                    grantResults[0] == PackageManager.PERMISSION_GRANTED
+            val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
             Sentry.addBreadcrumb("CAMERA permission ${if (granted) "granted" else "denied"}")
             if (granted) {
                 Toast.makeText(this, "Camera permission granted", Toast.LENGTH_SHORT).show()
@@ -150,7 +184,9 @@ class MainActivity : ComponentActivity() {
     @Keep
     private fun onGStreamerInitialized() {
         runOnUiThread {
-            uiMessage = "GStreamer ${nativeGetVersion()} ready"
+            val version = nativeGetVersion()
+            val v4l2status = nativeCheckV4L2()
+            uiMessage = "GStreamer $version ready\n$v4l2status"
             isGStreamerInitialized = true
         }
     }
@@ -221,6 +257,21 @@ class MainActivity : ComponentActivity() {
         return sb.toString()
     }
 
+    private fun findExternalCameraIds(): List<String> {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) return emptyList()
+        val cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        val externalIds = mutableListOf<String>()
+        for (id in cameraManager.cameraIdList) {
+            val chars = cameraManager.getCameraCharacteristics(id)
+            val isExternal = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                chars.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL) ==
+                        CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_EXTERNAL
+            } else false
+            if (isExternal) externalIds.add(id)
+        }
+        return externalIds
+    }
+
     private fun scanUSBDevices() {
         cameraList = emptyList()
         hasScanned = true
@@ -260,7 +311,49 @@ class MainActivity : ComponentActivity() {
         }
 
         Sentry.captureMessage("USB scan result: ${devices.size} devices, data: $jsonArray")
+
+        externalCameraIds = findExternalCameraIds()
+        if (externalCameraIds.isNotEmpty()) {
+            Sentry.captureMessage("External camera IDs: $externalCameraIds")
+        }
+
         nativeStartCameraDiscovery()
+    }
+
+    private fun findAndStartRawUSBCamera() {
+        val device = usbManager.deviceList.values.firstOrNull {
+            it.vendorId == 5546 && it.productId == 5461
+        }
+        if (device == null) {
+            Toast.makeText(this, "Camera device not found", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        if (!usbManager.hasPermission(device)) {
+            val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                PendingIntent.FLAG_MUTABLE
+            } else {
+                0
+            }
+            val pi = PendingIntent.getBroadcast(
+                this, 0,
+                Intent(ACTION_USB_PERMISSION).setPackage(packageName),
+                flags
+            )
+            usbManager.requestPermission(device, pi)
+            return
+        }
+
+        val connection = usbManager.openDevice(device)
+        val fd = connection?.fileDescriptor ?: run {
+            Toast.makeText(this, "Failed to open USB device", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        Sentry.addBreadcrumb("Starting raw USB camera with FD=$fd")
+        Sentry.captureMessage("Raw USB camera FD=$fd")
+        Toast.makeText(this, "Starting USB camera (raw FD)...", Toast.LENGTH_SHORT).show()
+        nativePlayCameraFD(fd)
     }
 
     @Composable
@@ -386,22 +479,100 @@ class MainActivity : ComponentActivity() {
 
             Spacer(Modifier.height(8.dp))
 
-            Button(
-                onClick = {
-                    val camIndex = 1
-                    Sentry.addBreadcrumb("Starting camera with index $camIndex")
-                    Sentry.captureMessage("Camera button pressed, index=$camIndex")
-                    Toast.makeText(this@MainActivity, "Starting camera index $camIndex", Toast.LENGTH_SHORT).show()
-                    nativePlayCamera(camIndex)
-                },
-                enabled = isGStreamerInitialized,
-                modifier = Modifier.padding(horizontal = 16.dp)
+            // ---------- Camera index input ----------
+            Text(
+                "Test camera by index:",
+                style = MaterialTheme.typography.titleSmall,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
+            )
+            var cameraIndexInput by remember { mutableStateOf("0") }
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp)
             ) {
-                Text("▶ Start Camera (index 1)")
+                OutlinedTextField(
+                    value = cameraIndexInput,
+                    onValueChange = { cameraIndexInput = it },
+                    label = { Text("Camera Index") },
+                    singleLine = true,
+                    modifier = Modifier.weight(1f)
+                )
+                Spacer(Modifier.width(8.dp))
+                Button(
+                    onClick = {
+                        val idx = cameraIndexInput.toIntOrNull()
+                        if (idx != null) {
+                            Sentry.addBreadcrumb("Testing camera index $idx")
+                            Sentry.captureMessage("Camera button pressed, index=$idx")
+                            Toast.makeText(this@MainActivity, "Trying camera index $idx", Toast.LENGTH_SHORT).show()
+                            nativePlayCamera(idx)
+                        }
+                    },
+                    enabled = isGStreamerInitialized
+                ) {
+                    Text("Start")
+                }
             }
 
             Spacer(Modifier.height(8.dp))
 
+            // External camera buttons (Camera2 IDs)
+            if (externalCameraIds.isNotEmpty()) {
+                Text(
+                    "External cameras:",
+                    style = MaterialTheme.typography.titleSmall,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
+                )
+                externalCameraIds.forEach { id ->
+                    Button(
+                        onClick = {
+                            Sentry.addBreadcrumb("Starting external camera with ID $id")
+                            Sentry.captureMessage("Starting camera, Camera2 ID=$id")
+                            Toast.makeText(this@MainActivity, "Starting camera ID $id", Toast.LENGTH_SHORT).show()
+                            val idx = id.toIntOrNull() ?: return@Button
+                            nativePlayCamera(idx)
+                        },
+                        enabled = isGStreamerInitialized,
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)
+                    ) {
+                        Text("▶ Start External Camera (ID: $id)")
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(8.dp))
+
+            // V4L2 source button
+            Button(
+                onClick = {
+                    val device = "/dev/video0"
+                    Sentry.addBreadcrumb("Starting v4l2src with device $device")
+                    Sentry.captureMessage("Starting v4l2 camera, device=$device")
+                    Toast.makeText(this@MainActivity, "Starting $device", Toast.LENGTH_SHORT).show()
+                    nativePlayCameraV4L2(device)
+                },
+                enabled = isGStreamerInitialized,
+                modifier = Modifier.padding(horizontal = 16.dp)
+            ) {
+                Text("▶ Start Camera (v4l2 /dev/video0)")
+            }
+
+            Spacer(Modifier.height(8.dp))
+
+            // Raw USB FD button
+            Button(
+                onClick = { findAndStartRawUSBCamera() },
+                enabled = isGStreamerInitialized,
+                modifier = Modifier.padding(horizontal = 16.dp)
+            ) {
+                Text("▶ Start Raw USB Camera (FD)")
+            }
+
+            Spacer(Modifier.height(8.dp))
+
+            // USB device list (information only)
             if (cameraList.isNotEmpty()) {
                 LazyColumn(modifier = Modifier.fillMaxWidth().weight(0.5f)) {
                     items(cameraList) { cam ->

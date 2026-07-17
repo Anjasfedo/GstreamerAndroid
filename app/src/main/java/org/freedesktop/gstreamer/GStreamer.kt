@@ -5,10 +5,8 @@ import android.content.res.AssetManager
 import java.io.*
 
 object GStreamer {
-    @JvmStatic
     @Throws(Exception::class)
     private external fun nativeInit(context: Context)
-
     @JvmStatic
     @Throws(Exception::class)
     fun init(context: Context) {
@@ -25,8 +23,9 @@ object GStreamer {
         val fontsCfg = File(fontsFCDir, "fonts.conf")
         fontsDir.mkdirs()
         try {
+            /* Copy the config file */
             copyFile(assetManager, "fontconfig/fonts.conf", fontsCfg)
-            for (filename in assetManager.list("fontconfig/fonts/truetype")!!) {
+            /* Copy the fonts */for (filename in assetManager.list("fontconfig/fonts/truetype")!!) {
                 val font = File(fontsDir, filename)
                 copyFile(assetManager, "fontconfig/fonts/truetype/$filename", font)
             }
@@ -43,6 +42,7 @@ object GStreamer {
         val certs = File(certsDir, "ca-certificates.crt")
         certsDir.mkdirs()
         try {
+            /* Copy the certificates file */
             copyFile(assetManager, "ssl/certs/ca-certificates.crt", certs)
         } catch (e: IOException) {
             e.printStackTrace()

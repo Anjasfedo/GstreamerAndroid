@@ -31,6 +31,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.*
+import androidx.compose.foundation.clickable
 
 class MainActivity : ComponentActivity() {
 
@@ -45,6 +46,8 @@ class MainActivity : ComponentActivity() {
     private external fun nativeSurfaceFinalize()
     private external fun nativeGetVersion(): String
     private external fun nativeStartCameraDiscovery()
+
+    private external fun nativePlayCamera(cameraIndex: Int)
 
     @Keep
     private var native_custom_data: Long = 0
@@ -375,7 +378,7 @@ class MainActivity : ComponentActivity() {
                 LazyColumn(modifier = Modifier.fillMaxWidth().weight(0.5f)) {
                     items(cameraList) { cam ->
                         if (cam.path.isEmpty()) {
-                            // Section header
+                            // section header
                             Text(
                                 text = cam.name,
                                 style = MaterialTheme.typography.titleSmall,
@@ -384,7 +387,15 @@ class MainActivity : ComponentActivity() {
                         } else {
                             ListItem(
                                 headlineContent = { Text(cam.name) },
-                                supportingContent = { Text(cam.path) }
+                                supportingContent = { Text(cam.path) },
+                                modifier = Modifier.clickable {
+                                    // If the camera is an external USB, try to play it via ahcsrc
+                                    if (cam.name.contains("External USB")) {
+                                        // Use camera ID from path (it's the Camera2 ID)
+                                        val id = cam.path.toIntOrNull() ?: 0
+                                        nativePlayCamera(id)
+                                    }
+                                }
                             )
                         }
                     }

@@ -4,7 +4,9 @@
 
     <!-- ADD THESE HERE -->
     <uses-permission android:name="android.permission.USB_HOST" />
+    <uses-permission android:name="android.permission.CAMERA" />
     <uses-feature android:name="android.hardware.usb.host" android:required="true" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
     <!-- END OF ADDITIONS -->
 
     <uses-permission android:name="android.permission.INTERNET" />
